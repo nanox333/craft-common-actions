@@ -51,7 +51,7 @@ Latest run: https://github.com/nanox333/craft-common-actions-fork/actions/runs/4
 
 - macOS import, sign and clean up: **passed**.
 - Windows, with and without a test certificate: **passed**: signed, timestamped and verified, and the `App [x64].exe` name handled literally.
-- macOS without a certificate: was still queued for a runner when this was written.
+- macOS without a certificate: **never ran**. It was cancelled twice while waiting for a macOS runner, with no steps started. #140's own tests cover that path with stand-ins. To try again: `gh run rerun 42059612990 --repo nanox333/craft-common-actions-fork --failed`.
 
 **Delete that branch when you're done:**
 
