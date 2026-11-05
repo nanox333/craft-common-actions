@@ -1,0 +1,156 @@
+name: Shared signing smoke test (throwaway)
+
+# Runs the shared macOS import and Windows signing setup the way release.yml will, on real runners,
+# with made-up test certificates. No real secrets; nothing is published. Delete this branch after.
+on:
+  push:
+    branches: [test/shared-signing-smoke]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS import, sign and clean up
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Make a trusted test Developer ID Application certificate
+        id: cert
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/test-cert"; mkdir -p "$work"; cd "$work"
+          cat >cert.cnf <<'EOF'
+          [req]
+          distinguished_name = dn
+          x509_extensions = ext
+          prompt = no
+          [dn]
+          CN = Developer ID Application: Craft Signing Smoke Test (TEST123456)
+          [ext]
+          basicConstraints = critical,CA:false
+          keyUsage = critical,digitalSignature
+          extendedKeyUsage = critical,codeSigning
+          EOF
+          /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 2 -config cert.cnf -keyout key.pem -out cert.pem
+          # Legacy algorithms: macOS `security import` reads these .p12 files reliably.
+          /usr/bin/openssl pkcs12 -export -inkey key.pem -in cert.pem -out cert.p12 -passout pass:smoke-test \
+            -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+          # find-identity -v lists only trusted identities, as a real Developer ID one is.
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain cert.pem
+          echo "p12=$(base64 -i cert.p12 | tr -d '\n')" >>"$GITHUB_OUTPUT"
+          rm key.pem cert.p12
+
+      # Exactly the step release.yml now runs, with the test certificate in place of the secrets.
+      - name: Import signing certificate
+        uses: storytold/craft-common-actions/actions/import-macos-certificate@main
+        with:
+          certificate: ${{ steps.cert.outputs.p12 }}
+          certificate-password: smoke-test
+          keychain-password: ""
+
+      - name: The exports are what package.sh reads, and no decoded bundle is left
+        run: |
+          set -euo pipefail
+          test -n "${MACOS_SIGN_IDENTITY:-}" || { echo "MACOS_SIGN_IDENTITY not set"; exit 1; }
+          test -f "${MACOS_KEYCHAIN:-}" || { echo "MACOS_KEYCHAIN not a file: ${MACOS_KEYCHAIN:-}"; exit 1; }
+          echo "identity $MACOS_SIGN_IDENTITY in $MACOS_KEYCHAIN"
+          left="$(find "$(dirname "$MACOS_KEYCHAIN")" -name '*.p12' -print)"
+          test -z "$left" || { echo "decoded certificate left behind: $left"; exit 1; }
+
+      - name: Sign and verify a program with the exported identity and keychain
+        run: |
+          set -euo pipefail
+          printf 'int main(void) { return 0; }\n' | clang -x c - -o "$RUNNER_TEMP/hello"
+          codesign --force --options runtime --timestamp=none \
+            --sign "$MACOS_SIGN_IDENTITY" --keychain "$MACOS_KEYCHAIN" "$RUNNER_TEMP/hello"
+          codesign --verify --strict --verbose=2 "$RUNNER_TEMP/hello"
+          codesign -dvv "$RUNNER_TEMP/hello" 2>&1 | grep 'Authority=Developer ID Application: Craft Signing Smoke Test'
+          "$RUNNER_TEMP/hello"
+
+      # The same clean-up line release.yml's "Remove temporary keychain" step runs.
+      - name: Remove temporary keychain
+        if: always()
+        run: |
+          if [ -n "${MACOS_KEYCHAIN:-}" ]; then security delete-keychain "$MACOS_KEYCHAIN" || true; fi
+          if [ -n "${MACOS_KEYCHAIN:-}" ] && [ -e "$MACOS_KEYCHAIN" ]; then echo "keychain still there"; exit 1; fi
+          echo "keychain removed"
+
+  macos-without-certificate:
+    name: macOS import without a certificate warns and goes on
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - name: Import signing certificate
+        uses: storytold/craft-common-actions/actions/import-macos-certificate@main
+        with:
+          certificate: ""
+          certificate-password: ""
+          keychain-password: ""
+      - name: Nothing is exported, so package.sh signs ad hoc
+        run: |
+          test -z "${MACOS_SIGN_IDENTITY:-}" && test -z "${MACOS_KEYCHAIN:-}"
+          echo "no identity, no keychain: unsigned test builds still work"
+
+  windows:
+    name: Windows signing setup, with a test certificate and without one
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      # The step release.yml and windows-arm64.yml now run before package.ps1.
+      - name: Set up the shared signing script
+        uses: storytold/craft-common-actions/actions/setup-windows-signing@main
+        with:
+          product-name: Craft Signing Smoke Test
+
+      - name: The exports are set
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath $env:CRAFT_SIGN_SCRIPT)) { throw "CRAFT_SIGN_SCRIPT is not a file: $env:CRAFT_SIGN_SCRIPT" }
+          if ($env:CRAFT_SIGN_PRODUCT -ne 'Craft Signing Smoke Test') { throw "CRAFT_SIGN_PRODUCT is '$env:CRAFT_SIGN_PRODUCT'" }
+          if ($env:CRAFT_SIGN_URL -ne "https://github.com/$env:GITHUB_REPOSITORY") { throw "CRAFT_SIGN_URL is '$env:CRAFT_SIGN_URL'" }
+          "script $env:CRAFT_SIGN_SCRIPT, product $env:CRAFT_SIGN_PRODUCT, url $env:CRAFT_SIGN_URL"
+
+      - name: Without secrets it warns and leaves the file unsigned (the ARM64 case)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:RUNNER_TEMP 'unsigned.exe'
+          Copy-Item "$env:WINDIR\System32\whoami.exe" $exe
+          $output = & $env:CRAFT_SIGN_SCRIPT $exe 2>&1 | Out-String
+          if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE`n$output" }
+          if ($output -notmatch 'Windows signing secrets not set') { throw "expected the unsigned warning:`n$output" }
+          $output
+
+      - name: With a trusted test certificate it signs and verifies (the release case)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Craft Signing Smoke Test' `
+            -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable -NotAfter (Get-Date).AddDays(2)
+          $password = ConvertTo-SecureString 'smoke-test' -AsPlainText -Force
+          $pfx = Join-Path $env:RUNNER_TEMP 'test.pfx'
+          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $password | Out-Null
+          # signtool verify /pa needs the chain trusted, as a real code-signing certificate is.
+          $cer = Join-Path $env:RUNNER_TEMP 'test.cer'
+          Export-Certificate -Cert $cert -FilePath $cer | Out-Null
+          Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+          # A program nobody has signed (a copy of a Windows file already carries Microsoft's
+          # signature), with brackets in its name, as sign.ps1 must read file names literally.
+          $exe = Join-Path $env:RUNNER_TEMP 'App [x64].exe'
+          $source = Join-Path $env:RUNNER_TEMP 'app.cs'
+          Set-Content -LiteralPath $source -Value 'public static class App { public static void Main() { } }'
+          & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:exe "/out:$exe" $source
+          if ($LASTEXITCODE) { throw "csc exited $LASTEXITCODE" }
+          if ((Get-AuthenticodeSignature -LiteralPath $exe).Status -ne 'NotSigned') { throw 'the test program is already signed' }
+          $env:WINDOWS_CERTIFICATE = [Convert]::ToBase64String([IO.File]::ReadAllBytes($pfx))
+          $env:WINDOWS_CERTIFICATE_PASSWORD = 'smoke-test'
+          & $env:CRAFT_SIGN_SCRIPT $exe
+          if ($LASTEXITCODE) { throw "sign.ps1 exited $LASTEXITCODE" }
+          $signature = Get-AuthenticodeSignature -LiteralPath $exe
+          if ($signature.SignerCertificate.Thumbprint -ne $cert.Thumbprint) { throw "not signed by the test certificate: $($signature.Status) $($signature.SignerCertificate.Subject)" }
+          if ($signature.Status -ne 'Valid') { throw "signature status $($signature.Status): $($signature.StatusMessage)" }
+          if (-not $signature.TimeStamperCertificate) { throw 'the signature has no timestamp' }
+          "signed by $($signature.SignerCertificate.Subject), status $($signature.Status)"
